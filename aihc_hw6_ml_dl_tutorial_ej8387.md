@@ -35,10 +35,14 @@ What factors, at admission, predict  patient death best?
 
 ![fit right](assets/feature_importance.png)
 
-Notable risks:
+**Notable risks:**
 - Septicemia
 - Brain bleeds
 - Advanced cancer
+<br>
+**Anomalous results:**
+- Married status (correlates with age?)
+- Catholic or Quaker (Data artifact? How many quakers *are* there?)
 
 ---
 
