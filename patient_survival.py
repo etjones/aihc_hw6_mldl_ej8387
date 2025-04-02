@@ -16,6 +16,9 @@ from sklearn.pipeline import Pipeline
 from sklearn.impute import SimpleImputer
 import matplotlib.pyplot as plt
 import sys
+import shap  # Add SHAP library
+import os
+import pickle  # For saving/loading SHAP values
 
 # Constants
 DB_PATH = "../mimic3.db"  # Adjust path as necessary
@@ -38,10 +41,7 @@ def load_data(db_path: str) -> tuple[pd.DataFrame, dict]:
     data["diagnoses_icd"] = _load_and_prepare_table(
         db, "diagnoses_icd", string_cols=["ICD9_CODE"]
     )
-    data["procedures_icd"] = _load_and_prepare_table(
-        db, "procedures_icd", string_cols=["ICD9_CODE"]
-    )
-    data["icustays"] = _load_and_prepare_table(db, "icustays", date_cols=["INTIME"])
+
     data["d_icd_diagnoses"] = _load_and_prepare_table(
         db, "d_icd_diagnoses", string_cols=["ICD9_CODE"]
     )
@@ -77,15 +77,8 @@ def load_data(db_path: str) -> tuple[pd.DataFrame, dict]:
 
     # Call helper functions for subsequent steps
     df = _calculate_age(df)
-    df = _merge_diagnosis_counts(df, data["diagnoses_icd"])
-    df = _merge_procedure_counts(df, data["procedures_icd"])
-    # df = _merge_icu_info(df, data["icustays"])
     df = _get_primary_diagnosis(df, data["diagnoses_icd"])
     df = _calculate_survival_days(df)
-
-    # Add HAS_CHARTEVENTS_DATA placeholder (assuming 1 if in admissions table)
-    # This might need refinement based on actual CHARTEVENTS availability check if needed
-    df["HAS_CHARTEVENTS_DATA"] = 1
 
     print(f"Data loading and feature engineering complete. Final shape: {df.shape}")
     # print("Final DataFrame columns:", df.columns.tolist())
@@ -163,64 +156,6 @@ def _calculate_age(df: pd.DataFrame) -> pd.DataFrame:
         df["AGE"] = df["AGE"].clip(upper=90)
 
     print(f"Calculated AGE. Missing values: {df['AGE'].isna().sum()}. Capped at 90.")
-    return df
-
-
-def _merge_diagnosis_counts(
-    df: pd.DataFrame, diagnoses_icd: pd.DataFrame
-) -> pd.DataFrame:
-    """Merges diagnosis counts per admission."""
-    if not diagnoses_icd.empty:
-        diag_counts = (
-            diagnoses_icd.groupby("HADM_ID").size().reset_index(name="NUM_DIAGNOSES")
-        )
-        df = pd.merge(df, diag_counts, on="HADM_ID", how="left")
-        df["NUM_DIAGNOSES"] = df["NUM_DIAGNOSES"].fillna(0).astype(int)
-        print(
-            f"Merged NUM_DIAGNOSES. Missing values: {df['NUM_DIAGNOSES'].isna().sum()}"
-        )
-    else:
-        df["NUM_DIAGNOSES"] = 0
-        print("Skipped merging NUM_DIAGNOSES due to empty input table.")
-    return df
-
-
-def _merge_procedure_counts(
-    df: pd.DataFrame, procedures_icd: pd.DataFrame
-) -> pd.DataFrame:
-    """Merges procedure counts per admission."""
-    if not procedures_icd.empty:
-        proc_counts = (
-            procedures_icd.groupby("HADM_ID").size().reset_index(name="NUM_PROCEDURES")
-        )
-        df = pd.merge(df, proc_counts, on="HADM_ID", how="left")
-        df["NUM_PROCEDURES"] = df["NUM_PROCEDURES"].fillna(0).astype(int)
-        print(
-            f"Merged NUM_PROCEDURES. Missing values: {df['NUM_PROCEDURES'].isna().sum()}"
-        )
-    else:
-        df["NUM_PROCEDURES"] = 0
-        print("Skipped merging NUM_PROCEDURES due to empty input table.")
-    return df
-
-
-def _merge_icu_info(df: pd.DataFrame, icustays: pd.DataFrame) -> pd.DataFrame:
-    """Merges ICU admission flag and first care unit."""
-    if not icustays.empty:
-        # Keep only the first ICU stay per HADM_ID based on INTIME
-        first_icu = icustays.loc[icustays.groupby("HADM_ID")["INTIME"].idxmin()][
-            ["HADM_ID", "FIRST_CAREUNIT"]
-        ]
-
-        df = pd.merge(df, first_icu, on="HADM_ID", how="left")
-        df["ICU_ADMISSION_FLAG"] = df["FIRST_CAREUNIT"].notna().astype(int)
-        print(
-            f"Merged ICU info. Missing FIRST_CAREUNIT: {df['FIRST_CAREUNIT'].isna().sum()}"
-        )
-    else:
-        df["FIRST_CAREUNIT"] = pd.NA
-        df["ICU_ADMISSION_FLAG"] = 0
-        print("Skipped merging ICU info due to empty input table.")
     return df
 
 
@@ -366,7 +301,7 @@ def preprocess_data(
     known_numerical = [
         "AGE",
         "ICU_ADMISSION_FLAG",
-    ]  # LOS, NUM_DIAGNOSES, NUM_PROCEDURES removed
+    ]  # LOS, removed
     for col in known_numerical:
         if col in X.columns and col not in numerical_features:
             numerical_features.append(col)
@@ -387,22 +322,6 @@ def preprocess_data(
 
     print(f"Final Categorical features for preprocessing: {categorical_features}")
     print(f"Final Numerical features for preprocessing: {numerical_features}")
-
-    # Remove NUM_DIAGNOSES and NUM_PROCEDURES if they exist in the list
-    features_to_exclude = ["NUM_DIAGNOSES", "NUM_PROCEDURES"]
-    numerical_features = [f for f in numerical_features if f not in features_to_exclude]
-    categorical_features = [
-        f for f in categorical_features if f not in features_to_exclude
-    ]
-    print(
-        f"Features after excluding counts: {numerical_features + categorical_features}"
-    )
-
-    # Check for empty lists
-    if not numerical_features and not categorical_features:
-        raise ValueError("No features identified for preprocessing.")
-    if X.empty:
-        raise ValueError("Feature set X is empty before creating preprocessor.")
 
     # --- Preprocessing Steps ---
     transformers = []
@@ -437,9 +356,6 @@ def preprocess_data(
     print("Fitting preprocessor...")
     X_processed = preprocessor.fit_transform(X)
 
-    # Convert processed data back to DataFrame for easier inspection (optional)
-    # Removed unused X_processed_df assignment
-
     print(f"Preprocessing complete. Processed feature shape: {X_processed.shape}")
     # Return the processed DataFrame, target Series, and the *fitted* preprocessor
     return X_processed, y, preprocessor
@@ -449,14 +365,6 @@ class PatientDataset(Dataset):
     """PyTorch Dataset for patient admission data."""
 
     def __init__(self, features: np.ndarray, labels: np.ndarray):
-        # Ensure features and labels are numpy arrays before converting to tensors
-        if not isinstance(features, np.ndarray):
-            raise TypeError(
-                f"Expected features to be numpy array, got {type(features)}"
-            )
-        if not isinstance(labels, np.ndarray):
-            raise TypeError(f"Expected labels to be numpy array, got {type(labels)}")
-
         self.features = torch.tensor(features, dtype=torch.float32)
         # Ensure labels are the correct shape [n_samples, 1] for regression loss (like MSELoss)
         self.labels = (
@@ -493,23 +401,20 @@ def get_feature_names(column_transformer: ColumnTransformer) -> list[str]:
         if name == "remainder":
             continue
         if hasattr(pipe, "get_feature_names_out"):
-            # For pipelines containing transformers like OneHotEncoder
+            # For sklearn >= 0.24
             feature_names = pipe.get_feature_names_out(features)
             output_features.extend(feature_names)
-        elif hasattr(pipe, "steps"):  # Handle Pipelines
-            # Get the last step (usually the transformer like OneHotEncoder or StandardScaler)
-            last_step = pipe.steps[-1][1]
-            if hasattr(last_step, "get_feature_names_out"):
-                # Prepend step names if needed, adjust based on pipeline structure
-                # This assumes the OneHotEncoder is the last step generating new names
-                transformed_names = last_step.get_feature_names_out(features)
-                output_features.extend(transformed_names)
-            else:
-                # For transformers like StandardScaler, names remain the same
-                output_features.extend(features)
+        elif hasattr(pipe, "get_feature_names"):
+            feature_names = pipe.get_feature_names()
+            output_features.extend(feature_names)
         else:
             # For simple transformers or if names don't change
             output_features.extend(features)
+
+    # Debug information
+    print(f"Number of features after preprocessing: {len(feature_names)}")
+    print(f"First 10 feature names: {feature_names[:10]}")
+
     return output_features
 
 
@@ -518,7 +423,6 @@ class SurvivalPredictor(nn.Module):
 
     def __init__(self, input_dim: int):
         super().__init__()
-        # TODO: Define model layers (e.g., linear layers, activations)
         self.layer_1 = nn.Linear(input_dim, 64)
         self.relu = nn.ReLU()
         self.layer_2 = nn.Linear(64, 32)
@@ -594,6 +498,48 @@ def train_model(
     return model, train_losses, val_losses
 
 
+def _train_model(
+    model: nn.Module,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    num_epochs: int = 10,
+    learning_rate: float = 0.001,
+) -> tuple[nn.Module, list[float], list[float]]:
+    """
+    Train a model for a specified number of epochs and track losses.
+
+    Args:
+        model: The neural network model to train
+        train_loader: DataLoader for training data
+        val_loader: DataLoader for validation data
+        num_epochs: Number of epochs to train for
+        learning_rate: Learning rate for optimization
+
+    Returns:
+        Tuple containing:
+        - Trained model
+        - List of training losses per epoch
+        - List of validation losses per epoch
+    """
+    train_losses = []
+    val_losses = []
+    for epoch in range(num_epochs):
+        model, epoch_train_losses, epoch_val_losses = train_model(
+            model, train_loader, val_loader, epochs=1, learning_rate=learning_rate
+        )
+        train_loss = epoch_train_losses[0]
+        val_loss = epoch_val_losses[0]
+
+        train_losses.append(train_loss)
+        val_losses.append(val_loss)
+
+        print(
+            f"Epoch [{epoch + 1}/{num_epochs}], Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}"
+        )
+
+    return model, train_losses, val_losses
+
+
 def evaluate_model(model: nn.Module, loader: DataLoader) -> float:
     """Evaluates the model on a given data loader."""
     model.eval()
@@ -610,30 +556,141 @@ def evaluate_model(model: nn.Module, loader: DataLoader) -> float:
     return total_loss / len(loader)
 
 
-def plot_losses(train_losses: list[float], val_losses: list[float]):
-    """Plots training and validation losses."""
-    plt.figure(figsize=(10, 5))
-    plt.plot(train_losses, label="Training Loss")
-    plt.plot(val_losses, label="Validation Loss")
-    plt.title("Training and Validation Loss Over Epochs")
+def plot_training_validation_loss(
+    train_losses, val_losses, output_path="assets/training_validation_loss.png"
+):
+    """Plot and save training and validation loss curves.
+
+    Args:
+        train_losses: List of training losses per epoch
+        val_losses: List of validation losses per epoch
+        output_path: Path to save the plot
+    """
+    plt.figure(figsize=(10, 6))
+    plt.plot(range(1, len(train_losses) + 1), train_losses, label="Training Loss")
+    plt.plot(range(1, len(val_losses) + 1), val_losses, label="Validation Loss")
     plt.xlabel("Epoch")
     plt.ylabel("Loss (MSE)")
+    plt.title("Training and Validation Loss")
     plt.legend()
     plt.grid(True)
-    plt.savefig("training_validation_loss.png")  # Save the plot
-    print("Saved training/validation loss plot to training_validation_loss.png")
+
+    # Ensure the directory exists
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+    # Save the plot
+    plt.savefig(output_path)
+    print(f"Saved training/validation loss plot to {output_path}")
 
 
-def _get_feature_names_from_preprocessor(
-    preprocessor: ColumnTransformer, X_val: pd.DataFrame
-) -> list[str]:
-    """Extract feature names from a fitted ColumnTransformer.
+def _get_feature_names_from_preprocessor(preprocessor, X):
+    """Get feature names from the preprocessor.
+
+    Args:
+        preprocessor: Fitted ColumnTransformer
+        X: Original features DataFrame
+
+    Returns:
+        List of feature names after preprocessing
+    """
+    # Get feature names from the preprocessor
+    if hasattr(preprocessor, "get_feature_names_out"):
+        feature_names = preprocessor.get_feature_names_out()
+    else:
+        # For older scikit-learn versions
+        feature_names = []
+        for name, transformer, columns in preprocessor.transformers_:
+            if name == "remainder":
+                continue
+            if hasattr(transformer, "get_feature_names_out"):
+                # For sklearn >= 0.24
+                feature_names.extend(transformer.get_feature_names_out())
+            elif hasattr(transformer, "get_feature_names"):
+                feature_names.extend(transformer.get_feature_names())
+            else:
+                # For simple transformers or if names don't change
+                feature_names.extend(columns)
+
+    # Debug information
+    print(f"Number of features after preprocessing: {len(feature_names)}")
+    print(f"First 10 feature names: {feature_names[:10]}")
+
+    return feature_names
+
+
+def _create_descriptive_feature_names(encoded_feature_names, icd9_map):
+    """Create more descriptive feature names for visualization.
+
+    Args:
+        encoded_feature_names: Feature names from the preprocessor
+        icd9_map: Dictionary mapping ICD9 codes to descriptions
+
+    Returns:
+        List of descriptive feature names
+    """
+    descriptive_names = []
+
+    for name in encoded_feature_names:
+        # Handle OneHotEncoder feature names (format: encoder__feature_value)
+        if "__" in name:
+            parts = name.split("__")
+            if len(parts) >= 2:
+                feature = parts[0].replace("onehotencoder", "").strip("_")
+                value = parts[1]
+
+                # Special handling for ICD9 codes
+                if feature == "PRIMARY_DIAGNOSIS_CODE" and value in icd9_map:
+                    descriptive_names.append(f"{feature}: {value} ({icd9_map[value]})")
+                else:
+                    descriptive_names.append(f"{feature}: {value}")
+            else:
+                descriptive_names.append(name)
+        else:
+            descriptive_names.append(name)
+
+    # Debug information
+    print(f"Number of descriptive feature names: {len(descriptive_names)}")
+    print(f"First 10 descriptive feature names: {descriptive_names[:10]}")
+
+    return descriptive_names
+
+
+def _get_permutation_feature_names(preprocessor, X_val, icd9_map):
+    """Extract feature names from a fitted ColumnTransformer for permutation importance.
 
     Handles different sklearn versions and fallback methods.
     """
     try:
         # For sklearn >= 0.24
-        return preprocessor.get_feature_names_out()
+        encoded_names = preprocessor.get_feature_names_out()
+
+        # Create human-readable feature names
+        descriptive_names = []
+        for name in encoded_names:
+            if name.startswith("cat__ICD9_CODE_") or name.startswith(
+                "cat__PRIMARY_DIAGNOSIS_CODE_"
+            ):
+                # Extract the code part
+                if name.startswith("cat__ICD9_CODE_"):
+                    code = name.split("cat__ICD9_CODE_")[-1]
+                else:
+                    code = name.split("cat__PRIMARY_DIAGNOSIS_CODE_")[-1]
+
+                description = icd9_map.get(code, f"Unknown ICD9 ({code})")
+                # Limit description length for readability
+                max_len = 40
+                descriptive_name = f"Diag: {description[:max_len]}{'...' if len(description) > max_len else ''}"
+                descriptive_names.append(descriptive_name)
+            elif name.startswith("num__"):
+                descriptive_names.append(name.split("num__")[-1])
+            elif name.startswith("cat__"):
+                # Handle other categorical features like FIRST_CAREUNIT
+                descriptive_names.append(name.split("cat__")[-1])
+            else:
+                descriptive_names.append(name)  # Keep original name if no prefix
+
+        return encoded_names, descriptive_names
+
     except AttributeError:
         # Fallback: Manual construction (less robust, assumes specific structure)
         print(
@@ -661,43 +718,29 @@ def _get_feature_names_from_preprocessor(
             cat_feature_names_out = cat_transformer.get_feature_names(cat_features)
         else:
             print("Error: Cannot extract feature names from categorical transformer.")
-            return []
+            return [], []
 
-        return list(numeric_feature_names) + list(cat_feature_names_out)
+        encoded_names = list(numeric_feature_names) + list(cat_feature_names_out)
 
+        # Create human-readable feature names (same as above)
+        descriptive_names = []
+        for name in encoded_names:
+            if "ICD9_CODE_" in name or "PRIMARY_DIAGNOSIS_CODE_" in name:
+                # Extract the code part
+                if "ICD9_CODE_" in name:
+                    code = name.split("ICD9_CODE_")[-1]
+                else:
+                    code = name.split("PRIMARY_DIAGNOSIS_CODE_")[-1]
 
-def _create_descriptive_feature_names(
-    encoded_feature_names: list[str], icd9_map: dict
-) -> list[str]:
-    """Create human-readable feature names from encoded feature names.
-
-    Handles ICD9 codes by adding their descriptions and cleans up prefixes.
-    """
-    descriptive_names = []
-    for name in encoded_feature_names:
-        if name.startswith("cat__ICD9_CODE_") or name.startswith(
-            "cat__PRIMARY_DIAGNOSIS_CODE_"
-        ):
-            # Extract the code part
-            if name.startswith("cat__ICD9_CODE_"):
-                code = name.split("cat__ICD9_CODE_")[-1]
+                description = icd9_map.get(code, f"Unknown ICD9 ({code})")
+                # Limit description length for readability
+                max_len = 40
+                descriptive_name = f"Diag: {description[:max_len]}{'...' if len(description) > max_len else ''}"
+                descriptive_names.append(descriptive_name)
             else:
-                code = name.split("cat__PRIMARY_DIAGNOSIS_CODE_")[-1]
+                descriptive_names.append(name)  # Keep original name if no prefix
 
-            description = icd9_map.get(code, f"Unknown ICD9 ({code})")
-            # Limit description length for readability
-            max_len = 40
-            descriptive_name = f"Diag: {description[:max_len]}{'...' if len(description) > max_len else ''}"
-            descriptive_names.append(descriptive_name)
-        elif name.startswith("num__"):
-            descriptive_names.append(name.split("num__")[-1])
-        elif name.startswith("cat__"):
-            # Handle other categorical features like FIRST_CAREUNIT
-            descriptive_names.append(name.split("cat__")[-1])
-        else:
-            descriptive_names.append(name)  # Keep original name if no prefix
-
-    return descriptive_names
+        return encoded_names, descriptive_names
 
 
 def calculate_feature_importance(
@@ -709,10 +752,10 @@ def calculate_feature_importance(
     n_top_features: int = 20,
     n_repeats: int = 5,
     random_state: int | None = None,
-    device: torch.device | str = "cpu",
-):
+) -> tuple[list[str], list[float]]:
     """Calculates and plots feature importance using permutation importance."""
     print("Calculating feature importance...")
+    device = get_torch_device()
 
     # Set random seed if provided
     if random_state is not None:
@@ -720,14 +763,9 @@ def calculate_feature_importance(
         torch.manual_seed(random_state)
 
     try:
-        # Get feature names from the preprocessor
-        encoded_feature_names = _get_feature_names_from_preprocessor(
-            preprocessor, X_val
-        )
-
-        # Create descriptive names for plotting
-        descriptive_feature_names = _create_descriptive_feature_names(
-            encoded_feature_names, icd9_map
+        # Get feature names from the preprocessor - use the original method for permutation importance
+        encoded_feature_names, descriptive_feature_names = (
+            _get_permutation_feature_names(preprocessor, X_val, icd9_map)
         )
 
         # Preprocess the validation data
@@ -738,7 +776,7 @@ def calculate_feature_importance(
         )
         print("Columns available in X_val:", X_val.columns.tolist())
         print("Preprocessor details:", preprocessor)
-        return
+        return [], []
 
     # Convert to tensor
     X_val_tensor = torch.tensor(X_val_processed, dtype=torch.float32).to(device)
@@ -747,9 +785,6 @@ def calculate_feature_importance(
     # Move model to the same device
     model = model.to(device)
     model.eval()  # Set model to evaluation mode
-
-    # Create a DataFrame with processed features for easier manipulation
-    # Removed unused X_val_processed_df assignment
 
     criterion = nn.MSELoss()
     importances = []
@@ -803,25 +838,381 @@ def calculate_feature_importance(
 
     # Select Top N Features based on importance scores
     importances_np = np.array(importances)
-    top_n_indices = np.argsort(importances_np)[-n_top_features:]
+    top_n_indices_array = np.argsort(importances_np)[-n_top_features:][::-1]
 
-    top_n_descriptive_names = [descriptive_feature_names[i] for i in top_n_indices]
-    top_n_importances = [importances[i] for i in top_n_indices]
+    top_n_descriptive_names = [
+        descriptive_feature_names[i] for i in top_n_indices_array
+    ]
+    top_n_importances = [importances[i] for i in top_n_indices_array]
 
-    # Plot Feature Importances
-    plt.figure(figsize=(10, n_top_features / 2))  # Adjust height based on N
-    plt.barh(range(n_top_features), top_n_importances, align="center")
-    plt.yticks(range(n_top_features), top_n_descriptive_names)
-    plt.xlabel("Permutation Importance (Increase in MSE)")
-    plt.title(f"Top {n_top_features} Feature Importances")
+    # Create a separate bar plot for feature importance magnitude
+    plt.figure(figsize=(10, n_top_features / 2))
+    # Sort features by absolute magnitude for the bar chart
+    sorted_indices = np.argsort(np.abs(top_n_importances))
+    sorted_features = [top_n_descriptive_names[i] for i in sorted_indices]
+    sorted_importances = [top_n_importances[i] for i in sorted_indices]
+    # Plot the bars
+    plt.barh(range(len(sorted_features)), sorted_importances, align="center")
+    plt.yticks(range(len(sorted_features)), sorted_features)
+    plt.xlabel("Feature Importance (MSE increase when feature is permuted)")
+    plt.title(f"Top {n_top_features} Features by Importance")
     plt.tight_layout()
 
-    # Save the plot
-    out_path = "assets/feature_importance.png"
-    plt.savefig(out_path)
-    print(f"Feature importance plot saved to {out_path}")
+    # Save the magnitude plot
+    out_path_magnitude = "assets/feature_importance.png"
+    plt.savefig(out_path_magnitude)
+    print(f"Sorted feature importance plot saved to {out_path_magnitude}")
+
+    # Create a DataFrame with feature impacts for easier interpretation
+    # Calculate mean SHAP values for the top features
+    mean_shap_values = []
+    for i, idx in enumerate(top_n_indices_array):
+        mean_shap = float(np.mean(top_n_importances[i]))
+        mean_shap_values.append(mean_shap)
+
+    impact_df = pd.DataFrame(
+        {
+            "Feature": top_n_descriptive_names,
+            "Mean_Abs_SHAP": top_n_importances,
+            "Mean_SHAP": mean_shap_values,
+        }
+    )
+
+    # Add direction interpretation
+    impact_df["Direction"] = impact_df["Mean_SHAP"].apply(
+        lambda x: "Increases survival days" if x > 0 else "Decreases survival days"
+    )
+
+    print("\nFeature Impact Summary:")
+    print(impact_df)
+
+    # Save the impact summary
+    impact_path = "assets/feature_impact_summary.csv"
+    impact_df.to_csv(impact_path, index=False)
+    print(f"Feature impact summary saved to {impact_path}")
 
     return top_n_descriptive_names, top_n_importances
+
+
+def calculate_shap_values(
+    model: nn.Module,
+    preprocessor: ColumnTransformer,
+    X_val: pd.DataFrame,  # Original validation features before preprocessing
+    y_val: pd.Series,
+    icd9_map: dict,  # Mapping from ICD9 code to description
+    n_top_features: int = 20,
+    n_background_samples: int = 100,
+    random_state: int | None = None,
+    force_recalculate: bool = False,
+) -> tuple[list[str], list[float]]:
+    """Calculates and plots SHAP values to interpret feature importance with direction.
+
+    Unlike permutation importance, SHAP values show both magnitude AND direction
+    of feature impact on predictions.
+
+    Args:
+        model: Trained PyTorch model
+        preprocessor: Fitted ColumnTransformer
+        X_val: Original validation features (before preprocessing)
+        y_val: Validation target values
+        icd9_map: Dictionary mapping ICD9 codes to descriptions
+        n_top_features: Number of top features to display
+        n_background_samples: Number of background samples for SHAP explainer
+        random_state: Random seed for reproducibility
+        force_recalculate: If True, recalculate SHAP values even if cached values exist
+
+    Returns:
+        Tuple of (feature_names, shap_values) for the top features
+    """
+    # Create assets directory if it doesn't exist
+    os.makedirs("assets", exist_ok=True)
+
+    # Define checkpoint paths
+    shap_checkpoint_path = "assets/shap_values_checkpoint.pkl"
+
+    # If force_recalculate is True, delete the existing checkpoint file
+    if force_recalculate and os.path.exists(shap_checkpoint_path):
+        print(
+            f"Force recalculate flag is set. Deleting existing checkpoint: {shap_checkpoint_path}"
+        )
+        os.remove(shap_checkpoint_path)
+
+    # shap values take a long time to compute; load from disk if available
+    if not force_recalculate and os.path.exists(shap_checkpoint_path):
+        print("Loading SHAP values from checkpoint...")
+        try:
+            with open(shap_checkpoint_path, "rb") as f:
+                checkpoint = pickle.load(f)
+
+        except Exception as e:
+            print(f"Error loading checkpoint: {e}. Recalculating SHAP values...")
+            force_recalculate = True
+
+    # If no saved checkpoint, calculate shap values and save to disk
+    else:
+        print("Calculating SHAP values for feature importance interpretation...")
+        device = get_torch_device()
+
+        # Set random seed if provided
+        if random_state is not None:
+            np.random.seed(random_state)
+            torch.manual_seed(random_state)
+
+        # Preprocess the validation data first
+        X_val_processed = preprocessor.transform(X_val)
+        print(f"X_val shape before preprocessing: {X_val.shape}")
+        print(f"X_val shape after preprocessing: {X_val_processed.shape}")
+
+        # Get feature names from the preprocessor
+        encoded_feature_names = _get_feature_names_from_preprocessor(
+            preprocessor, X_val
+        )
+
+        # Create descriptive names for plotting
+        descriptive_feature_names = _create_descriptive_feature_names(
+            encoded_feature_names, icd9_map
+        )
+
+        # Verify feature names match the processed data dimensions
+        if len(encoded_feature_names) != X_val_processed.shape[1]:
+            print(
+                f"WARNING: Feature names count ({len(encoded_feature_names)}) doesn't match processed data shape ({X_val_processed.shape[1]})"
+            )
+            # Fallback to generic feature names if mismatch
+            encoded_feature_names = [
+                f"feature_{i}" for i in range(X_val_processed.shape[1])
+            ]
+            descriptive_feature_names = encoded_feature_names.copy()
+
+        # Move model to the same device and set to evaluation mode
+        model = model.to(device)
+        model.eval()
+
+        # Create a PyTorch model wrapper for SHAP
+        class ModelWrapper:
+            def __init__(self, model):
+                self.model = model
+
+            def __call__(self, X):
+                with torch.no_grad():
+                    # Convert to numpy array first if it's not already
+                    if not isinstance(X, np.ndarray):
+                        X = np.array(X)
+                    X_tensor = torch.tensor(X, dtype=torch.float32).to(device)
+                    return self.model(X_tensor).cpu().numpy()
+
+        model_wrapper = ModelWrapper(model)
+
+        # Sample background data for the SHAP explainer (for computational efficiency)
+        if n_background_samples < X_val_processed.shape[0]:
+            background_indices = np.random.choice(
+                X_val_processed.shape[0], n_background_samples, replace=False
+            )
+            background_data = X_val_processed[background_indices]
+        else:
+            background_data = X_val_processed
+
+        # Create the SHAP explainer
+        # Try using KernelExplainer which works with any model
+        explainer = shap.KernelExplainer(model_wrapper, background_data)
+
+        # Calculate SHAP values for validation data
+        # For efficiency, we can use a subset of validation data
+        n_samples = min(
+            300, X_val_processed.shape[0]
+        )  # Limit to 300 samples for efficiency
+        sample_indices = np.random.choice(
+            X_val_processed.shape[0], n_samples, replace=False
+        )
+        X_val_processed_sample = X_val_processed[sample_indices]
+
+        # Convert sample indices to integer to avoid the error
+        sample_indices = sample_indices.astype(int)
+
+        # Calculate SHAP values
+        shap_values = explainer.shap_values(X_val_processed_sample)
+
+        # If shap_values is a list (multi-output model), take the first element
+        if isinstance(shap_values, list):
+            shap_values = shap_values[0]
+
+        # Calculate mean absolute SHAP value for each feature
+        mean_abs_shap = np.abs(shap_values).mean(axis=0)
+
+        # Debug information
+        print(f"SHAP values shape: {shap_values.shape}")
+        print(f"Mean absolute SHAP values shape: {mean_abs_shap.shape}")
+        print(f"Top 5 mean absolute SHAP values: {mean_abs_shap[:5]}")
+
+        # Get indices of top features by mean absolute SHAP value
+        top_n_indices_array = np.argsort(mean_abs_shap)[-n_top_features:]
+
+        # Debug information
+        print(f"Top indices array: {top_n_indices_array}")
+
+        # Convert indices to Python integers to avoid numpy array indexing issues
+        top_indices = [int(i) for i in top_n_indices_array]
+
+        # Debug information
+        print(f"Top indices as integers: {top_indices}")
+
+        # Check for unique indices
+        if len(set(top_indices)) < len(top_indices):
+            print("WARNING: Duplicate indices found in top_indices!")
+            # Ensure unique indices
+            top_indices = list(dict.fromkeys(top_indices))
+            # If we don't have enough unique indices, add more
+            while len(top_indices) < n_top_features:
+                # Find next best index not already in top_indices
+                for i in range(len(mean_abs_shap)):
+                    if i not in top_indices:
+                        top_indices.append(i)
+                        if len(top_indices) >= n_top_features:
+                            break
+
+        # Get names and SHAP values for top features
+        top_feature_names = [descriptive_feature_names[i] for i in top_indices]
+        top_feature_shap = [float(mean_abs_shap[i]) for i in top_indices]
+
+        # Save checkpoint
+        checkpoint = {
+            "shap_values": shap_values,
+            "feature_names": encoded_feature_names,
+            "descriptive_feature_names": descriptive_feature_names,
+            "X_val_processed_sample": X_val_processed_sample,
+            "mean_abs_shap": mean_abs_shap,
+            "top_indices": top_indices,
+            "top_feature_names": top_feature_names,
+            "top_feature_shap": top_feature_shap,
+        }
+
+        with open(shap_checkpoint_path, "wb") as f:
+            pickle.dump(checkpoint, f)
+        print(f"Saved SHAP values to checkpoint: {shap_checkpoint_path}")
+
+    # Extract data from checkpoint
+    shap_values = checkpoint["shap_values"]
+    encoded_feature_names = checkpoint["feature_names"]
+    descriptive_feature_names = checkpoint["descriptive_feature_names"]
+    X_val_processed_sample = checkpoint["X_val_processed_sample"]
+    mean_abs_shap = checkpoint["mean_abs_shap"]
+    top_indices = checkpoint["top_indices"]
+    top_feature_names = checkpoint["top_feature_names"]
+    top_feature_shap = checkpoint["top_feature_shap"]
+
+    print("Successfully loaded SHAP values from checkpoint.")
+
+    # Skip to plotting with loaded values
+    print("Generating plots from cached SHAP values...")
+
+    # Debug information
+    print(f"Top feature names: {top_feature_names}")
+    print(f"Top feature SHAP values: {top_feature_shap}")
+
+    # Calculate mean SHAP values for the top features
+    mean_shap_values = []
+    for i, idx in enumerate(top_indices):
+        mean_shap = float(np.mean(shap_values[:, idx]))
+        mean_shap_values.append(mean_shap)
+
+    # Create a DataFrame with feature impacts for easier interpretation
+    impact_df = pd.DataFrame(
+        {
+            "Feature": top_feature_names,
+            "Mean_Abs_SHAP": top_feature_shap,
+            "Mean_SHAP": mean_shap_values,
+        }
+    )
+
+    # Add direction interpretation
+    impact_df["Direction"] = impact_df["Mean_SHAP"].apply(
+        lambda x: "Increases survival days" if x > 0 else "Decreases survival days"
+    )
+
+    print("\nFeature Impact Summary:")
+    print(impact_df)
+
+    # Save the impact summary
+    impact_path = "assets/feature_impact_summary.csv"
+    impact_df.to_csv(impact_path, index=False)
+    print(f"Feature impact summary saved to {impact_path}")
+
+    # Create a separate bar plot for feature importance magnitude
+    plt.figure(figsize=(10, n_top_features / 2))
+    # Sort features by absolute magnitude for the bar chart
+    sorted_indices = np.argsort(np.abs(mean_shap_values))
+    sorted_features = [top_feature_names[i] for i in sorted_indices]
+    sorted_shap_values = [mean_shap_values[i] for i in sorted_indices]
+    # Create color map based on positive/negative values
+    colors = ["red" if x < 0 else "green" for x in sorted_shap_values]
+    # Plot the bars
+    plt.barh(
+        range(len(sorted_features)),
+        sorted_shap_values,
+        align="center",
+        color=colors,
+    )
+    plt.yticks(range(len(sorted_features)), sorted_features)
+    plt.xlabel("Mean SHAP Value (+ increases, - decreases survival days)")
+    plt.title(f"Top {n_top_features} Features by SHAP Value (Sorted by Magnitude)")
+    # Add a legend
+    from matplotlib.patches import Patch
+
+    legend_elements = [
+        Patch(facecolor="green", label="Increases survival days"),
+        Patch(facecolor="red", label="Decreases survival days"),
+    ]
+    plt.legend(handles=legend_elements, loc="lower right")
+    plt.tight_layout()
+
+    # Save the magnitude plot
+    out_path_magnitude = "assets/shap_feature_magnitude.png"
+    plt.savefig(out_path_magnitude)
+    print(f"SHAP feature magnitude plot saved to {out_path_magnitude}")
+
+
+def run_feature_importance_analysis(
+    model: nn.Module,
+    preprocessor: ColumnTransformer,
+    raw_df: pd.DataFrame,
+    icd9_map: dict,
+    target_column: str = "SURVIVAL_DAYS",
+    force_recalculate_shap: bool = False,
+):
+    """Run feature importance analysis on the trained model.
+
+    This will calculate both permutation importance and SHAP values
+    for feature interpretation.
+
+    Args:
+        model: Trained PyTorch model
+        preprocessor: Fitted ColumnTransformer
+        raw_df: Raw dataframe with all columns
+        icd9_map: Dictionary mapping ICD9 codes to descriptions
+        target_column: Name of the target column
+        force_recalculate_shap: If True, recalculate SHAP values even if cached values exist
+    """
+    # Prepare data for feature importance calculation
+    X_val, y_val = _prepare_data_for_feature_importance(raw_df, target_column)
+
+    # Calculate feature importance using permutation importance
+    calculate_feature_importance(
+        model=model,
+        preprocessor=preprocessor,
+        X_val=X_val,
+        y_val=y_val,
+        icd9_map=icd9_map,
+    )
+
+    # Calculate SHAP values for feature importance interpretation
+    calculate_shap_values(
+        model=model,
+        preprocessor=preprocessor,
+        X_val=X_val,
+        y_val=y_val,
+        icd9_map=icd9_map,
+        force_recalculate=force_recalculate_shap,
+    )
 
 
 def _prepare_data_for_feature_importance(
@@ -872,8 +1263,7 @@ def _prepare_data_for_feature_importance(
         "DIAGNOSIS",
         "HOSPITAL_EXPIRE_FLAG",
         "DISCHARGE_LOCATION",  # Leaky columns
-        "NUM_DIAGNOSES",
-        "NUM_PROCEDURES",  # Exclude counts for this run
+        # "HAS_CHARTEVENTS_DATA",
     ]
     X_original = X_original.drop(
         columns=[col for col in columns_to_drop if col in X_original.columns],
@@ -884,138 +1274,68 @@ def _prepare_data_for_feature_importance(
     return X_original, y_original
 
 
-def run_feature_importance_analysis(
-    model: nn.Module,
-    preprocessor: ColumnTransformer,
-    raw_df: pd.DataFrame,
-    y_val: pd.Series,
-    icd9_map: dict,
-    target_column: str = "SURVIVAL_DAYS",
-    n_repeats: int = 2,
-    n_top_features: int = 20,
-    random_state: int = 42,
-) -> None:
-    """Run feature importance analysis on the model.
-
-    Args:
-        model: Trained neural network model
-        preprocessor: Fitted preprocessor
-        raw_df: Raw dataframe with all columns
-        y_val: Validation target values
-        icd9_map: Dictionary mapping ICD9 codes to descriptions
-        target_column: Name of the target column
-        n_repeats: Number of permutation repeats
-        n_top_features: Number of top features to display
-        random_state: Random seed for reproducibility
-    """
-    # Prepare data for feature importance
-    X_original, y_original = _prepare_data_for_feature_importance(raw_df, target_column)
-
-    # Split data to match the same validation set used in training
-    _, X_val_original, _, _ = train_test_split(
-        X_original, y_original, test_size=0.2, random_state=random_state
-    )
-
-    # Check if X_val_original is available and has columns
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    calculate_feature_importance(
-        model,
-        preprocessor=preprocessor,
-        X_val=X_val_original,
-        y_val=y_val,
-        icd9_map=icd9_map,
-        n_repeats=n_repeats,
-        n_top_features=n_top_features,
-        random_state=random_state,
-        device=device,
-    )
+def get_torch_device():
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 def main():
     """Main execution function."""
     # 1. Load Data: convert tables to dataframes, and merge frames to get the
     # features we're interested in
-    raw_df, icd9_map = load_data("../mimic3.db")
+    raw_df, icd9_map = load_data(DB_PATH)
 
     # 2. Preprocess Data (Calculates target, handles features, splits)
     # Use copy to avoid modifying original raw_df
-    X_processed, y, preprocessor = preprocess_data(raw_df.copy())
+    X, y, preprocessor = preprocess_data(raw_df.copy())
 
-    # Split data *after* preprocessing
-    print("Splitting data...")
-    X_train, X_val, y_train, y_val = train_test_split(
-        X_processed, y, test_size=0.2, random_state=42
+    # 3. Split Data
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=42
     )
 
-    # Convert to numpy arrays before creating Tensors (DataFrames might cause issues)
+    # Convert to numpy arrays
     X_train_np = X_train
-    X_val_np = X_val
+    X_test_np = X_test
     y_train_np = y_train.values
-    y_val_np = y_val.values
+    y_test_np = y_test.values
 
-    # 3. Create Datasets and DataLoaders
+    # Create PyTorch datasets
     train_dataset = PatientDataset(X_train_np, y_train_np)
-    val_dataset = PatientDataset(X_val_np, y_val_np)
+    val_dataset = PatientDataset(X_test_np, y_test_np)
 
+    # Create data loaders
     train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True, num_workers=0)
     val_loader = DataLoader(val_dataset, batch_size=64, shuffle=False, num_workers=0)
 
     # 4. Initialize Model
     input_dim = X_train_np.shape[1]  # Number of features after preprocessing
-    model = SurvivalPredictor(input_dim=input_dim)
-
-    # 5. Training Setup
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = model.to(device)
+    model = SurvivalPredictor(input_dim=input_dim).to(get_torch_device())
 
     # 6. Initial Validation
     val_loss = evaluate_model(model, val_loader)
     print(f"Initial Validation Loss (MSE): {val_loss:.4f}")
 
     # 7. Train the model
-    train_losses = []
-    val_losses = []
-    for epoch in range(10):
-        model, epoch_train_losses, epoch_val_losses = train_model(
-            model, train_loader, val_loader, epochs=1, learning_rate=0.001
-        )
-        train_loss = epoch_train_losses[0]
-        val_loss = epoch_val_losses[0]
-
-        train_losses.append(train_loss)
-        val_losses.append(val_loss)
-
-        print(
-            f"Epoch [{epoch + 1}/10], Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}"
-        )
-
+    model, train_losses, val_losses = _train_model(
+        model, train_loader, val_loader, num_epochs=10, learning_rate=0.001
+    )
     print("Training finished.")
     print(f"Final Validation Loss (MSE): {val_losses[-1]:.4f}")
 
     # 8. Plot Training/Validation Loss
-    plt.figure(figsize=(10, 6))
-    plt.plot(range(1, 11), train_losses, label="Training Loss")
-    plt.plot(range(1, 11), val_losses, label="Validation Loss")
-    plt.xlabel("Epoch")
-    plt.ylabel("Loss (MSE)")
-    plt.title("Training and Validation Loss")
-    plt.legend()
-    plt.grid(True)
-    out_path = "assets/training_validation_loss.png"
-    plt.savefig(out_path)
-    print(f"Saved training/validation loss plot to {out_path}")
+    plot_training_validation_loss(train_losses, val_losses)
 
     # 9. Feature Importance Analysis
+    # Check if we should force recalculation of SHAP values
+    force_recalculate_shap = "--force-shap" in sys.argv
+
     run_feature_importance_analysis(
         model=model,
         preprocessor=preprocessor,
-        raw_df=raw_df.copy(),
-        y_val=y_val,
+        raw_df=raw_df,
         icd9_map=icd9_map,
         target_column=TARGET_COLUMN,
-        n_repeats=2,
-        n_top_features=20,
-        random_state=42,
+        force_recalculate_shap=force_recalculate_shap,
     )
 
     print("\nPipeline execution complete.")

@@ -1,3 +1,4 @@
+#! /usr/bin/env python3
 """
 Generates syntax-highlighted images of Python functions.
 
@@ -21,7 +22,7 @@ DEFAULT_THEME = "monokai"  # A popular dark theme
 
 
 def find_function_source(file_path: str, function_name: str) -> str:
-    """Finds and returns the source code of a function in a given file."""
+    """Finds and returns the source code of a callable in a given file."""
     if not os.path.exists(file_path):
         raise FileNotFoundError(f"Error: File not found at {file_path}")
 
@@ -36,21 +37,75 @@ def find_function_source(file_path: str, function_name: str) -> str:
     except Exception as e:
         raise ImportError(f"Error executing module {file_path}: {e}") from e
 
-    function_obj = getattr(module, function_name, None)
-    if function_obj is None or not inspect.isfunction(function_obj):
+    callable_obj = getattr(module, function_name, None)
+    if callable_obj is None or (
+        not inspect.isfunction(callable_obj) and not inspect.isclass(callable_obj)
+    ):
         raise AttributeError(
             f"Error: Function '{function_name}' not found in {file_path}"
         )
 
     try:
-        source_code = inspect.getsource(function_obj)
+        source_code = inspect.getsource(callable_obj)
         # Dedent the source code to remove common leading whitespace
         source_code = inspect.cleandoc(source_code)
         return source_code
-    except OSError as e:
-        raise OSError(
-            f"Error reading source code for '{function_name}' from {file_path}: {e}"
-        ) from e
+    except (OSError, TypeError) as e:
+        # Handle the "built-in class" error or other inspection errors
+        if isinstance(e, TypeError) and "is a built-in class" in str(e):
+            print(
+                f"Warning: {function_name} reported as built-in class. Attempting fallback method..."
+            )
+            return _extract_class_from_file(file_path, function_name)
+        else:
+            raise OSError(
+                f"Error reading source code for '{function_name}' from {file_path}: {e}"
+            ) from e
+
+
+def _extract_class_from_file(file_path: str, class_name: str) -> str:
+    """
+    Fallback method to extract a class definition from a file by parsing the file content.
+    Used when inspect.getsource() fails with "built-in class" error.
+    """
+    with open(file_path, "r") as f:
+        content = f.read()
+
+    # Look for class definition
+    class_pattern = f"class {class_name}[:(]"
+    import re
+
+    match = re.search(class_pattern, content)
+    if not match:
+        raise AttributeError(f"Could not find class '{class_name}' in {file_path}")
+
+    start_pos = match.start()
+
+    # Find the indentation level of the class definition
+    line_start = content.rfind("\n", 0, start_pos) + 1
+    indent = start_pos - line_start
+
+    # Extract the class definition
+    lines = content[start_pos:].split("\n")
+    class_lines = [lines[0]]
+
+    # Process subsequent lines to find the end of the class
+    for i, line in enumerate(lines[1:], 1):
+        # Skip empty lines
+        if not line.strip():
+            class_lines.append(line)
+            continue
+
+        # Check if the line has less indentation than the class
+        # which would indicate the end of the class definition
+        current_indent = len(line) - len(line.lstrip())
+        if current_indent <= indent and line.strip():
+            break
+
+        class_lines.append(line)
+
+    class_source = "\n".join(class_lines)
+    return inspect.cleandoc(class_source)
 
 
 def code_to_image(
@@ -219,16 +274,16 @@ def jupyter_code_to_image(
 def main():
     """Command-line interface handler."""
     parser = argparse.ArgumentParser(
-        description="Generate a syntax-highlighted image of a Python function."
+        description="Generate a syntax-highlighted image of a Python function or class."
     )
     parser.add_argument(
         "-f",
         "--file",
         required=True,
-        help="Path to the Python file containing the function.",
+        help="Path to the Python file containing the callable to image",
     )
     parser.add_argument(
-        "-n", "--name", required=True, help="Name of the function to image."
+        "-n", "--name", required=True, help="Name of the callable to image."
     )
     parser.add_argument(
         "-o",
@@ -249,11 +304,13 @@ def main():
         default=18,
         help="Font size for the code. Default: 18",
     )
+    # Don't show line numbers by default; as currently written, they won't
+    # be correct to the file
     parser.add_argument(
-        "--no-line-numbers",
-        action="store_false",  # Sets line_numbers to False if flag is present
+        "--line-numbers",
+        action="store_true",
         dest="line_numbers",
-        help="Omit line numbers from the image.",
+        help="Add line numbers to the image.",
     )
     parser.add_argument(
         "--format",

@@ -12,6 +12,7 @@ dependencies = [
     "pillow>=11.1.0",
     "pygments>=2.19.1",
     "scikit-learn>=1.6.1",
+    "shap>=0.47.1",
     "sqlite-utils>=3.38",
     "torch>=2.6.0",
 ]
